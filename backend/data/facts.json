@@ -1,0 +1,21 @@
+{
+  "full_name": "Navin Bhaskar",
+  "name": "Navin",
+  "current_role": "Freelance AI Developer",
+  "location": "Bengaluru, India",
+  "email": "navin.bhaskar@example.com",
+  "linkedin": "https://www.linkedin.com/in/navin-bhaskar-5b281219/",
+  "specialties": [
+    "Python Programming",
+    "Machine Learning",
+    "Natural Language Processing"
+  ],
+  "years_experience": 10,
+  "education": [
+    {
+      "degree": "MS in embedded systems",
+      "institution": "MCIS University, Manipal, India",
+      "year": "2012"
+    }
+  ]
+}
