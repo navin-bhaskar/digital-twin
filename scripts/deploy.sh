@@ -1,72 +1,64 @@
-#!/usr/bin/env bash
+#!/bin/bash
+set -e
 
-# Stop execution immediately if any command fails
-set -eo pipefail
+ENVIRONMENT=${1:-dev}          # dev | test | prod
+PROJECT_NAME=${2:-twin}
 
-# 1. Environment Validation
-TARGET_ENV="${1:-dev}"
-echo "=========================================="
-echo "🚀 Starting Deployment for Environment: ${TARGET_ENV}"
-echo "=========================================="
+echo "🚀 Deploying ${PROJECT_NAME} to ${ENVIRONMENT}..."
 
-if [[ ! "$TARGET_ENV" =~ ^(dev|test|prod)$ ]]; then
-  echo "❌ Error: Invalid environment '$TARGET_ENV'. Must be one of: dev, test, prod"
-  exit 1
-fi
+# 1. Build Lambda package
+cd "$(dirname "$0")/.."        # project root
+echo "📦 Building Lambda package..."
+(cd backend && uv run deploy.py)
 
-# 2. Build Frontend Assets (Node.js)
-if [ -d "frontend" ]; then
-  echo "📦 Building Frontend application..."
-  cd frontend
-  npm ci
-  npm run build --if-present
-  cd ..
-else
-  echo "⚠️ No 'frontend' directory found, skipping Node build."
-fi
-
-# 3. Setup Python Virtual Environment (using uv)
-if [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
-  echo "🐍 Setting up Python environment with uv..."
-  uv venv .venv
-  source .venv/bin/activate
-  
-  if [ -f "pyproject.toml" ]; then
-    uv pip install .
-  elif [ -f "requirements.txt" ]; then
-    uv pip install -r requirements.txt
-  fi
-fi
-
-# 4. Terraform Workspace Selection & Deployment
-echo "🏗️ Running Terraform Provisioning..."
+# 2. Terraform workspace & apply
 cd terraform
+# New lines:
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+AWS_REGION=${DEFAULT_AWS_REGION:-us-east-1}
+terraform init -input=false \
+  -backend-config="bucket=twin-terraform-state-${AWS_ACCOUNT_ID}" \
+  -backend-config="key=${ENVIRONMENT}/terraform.tfstate" \
+  -backend-config="region=${AWS_REGION}" \
+  -backend-config="dynamodb_table=twin-terraform-locks" \
+  -backend-config="encrypt=true"
 
-# Ensure backend initialization
-terraform init -input=false
-
-# Select workspace or create it if it doesn't exist
-terraform workspace select "$TARGET_ENV" 2>/dev/null || terraform workspace new "$TARGET_ENV"
-
-# Execute Terraform Plan and Apply
-terraform plan -var-file="${TARGET_ENV}.tfvars" -out="tfplan-${TARGET_ENV}" -input=false 2>/dev/null || terraform plan -out="tfplan-${TARGET_ENV}" -input=false
-terraform apply -input=false "tfplan-${TARGET_ENV}"
-
-# 5. Sync Frontend Build Artifacts to S3 Bucket
-FRONTEND_BUCKET=$(terraform output -raw s3_frontend_bucket 2>/dev/null || echo "")
-
-if [ -n "$FRONTEND_BUCKET" ] && [ -d "../frontend/dist" ]; then
-  echo "📤 Uploading frontend build to S3 Bucket: s3://${FRONTEND_BUCKET}..."
-  aws s3 sync ../frontend/dist "s3://${FRONTEND_BUCKET}" --delete
-elif [ -n "$FRONTEND_BUCKET" ] && [ -d "../frontend/build" ]; then
-  echo "📤 Uploading frontend build to S3 Bucket: s3://${FRONTEND_BUCKET}..."
-  aws s3 sync ../frontend/build "s3://${FRONTEND_BUCKET}" --delete
+if ! terraform workspace list | grep -q "$ENVIRONMENT"; then
+  terraform workspace new "$ENVIRONMENT"
 else
-  echo "ℹ️ Skipping S3 sync (Bucket output or frontend build directory not found)."
+  terraform workspace select "$ENVIRONMENT"
 fi
 
+# Use prod.tfvars for production environment
+if [ "$ENVIRONMENT" = "prod" ]; then
+  TF_APPLY_CMD=(terraform apply -var-file=prod.tfvars -var="project_name=$PROJECT_NAME" -var="environment=$ENVIRONMENT" -auto-approve)
+else
+  TF_APPLY_CMD=(terraform apply -var="project_name=$PROJECT_NAME" -var="environment=$ENVIRONMENT" -auto-approve)
+fi
+
+echo "🎯 Applying Terraform..."
+"${TF_APPLY_CMD[@]}"
+
+API_URL=$(terraform output -raw api_gateway_url)
+FRONTEND_BUCKET=$(terraform output -raw s3_frontend_bucket)
+CUSTOM_URL=$(terraform output -raw custom_domain_url 2>/dev/null || true)
+
+# 3. Build + deploy frontend
+cd ../frontend
+
+# Create production environment file with API URL
+echo "📝 Setting API URL for production..."
+echo "NEXT_PUBLIC_API_URL=$API_URL" > .env.production
+
+npm install
+npm run build
+aws s3 sync ./out "s3://$FRONTEND_BUCKET/" --delete
 cd ..
 
-echo "=========================================="
-echo "✅ Script execution finished successfully!"
-echo "=========================================="
+# 4. Final messages
+echo -e "\n✅ Deployment complete!"
+echo "🌐 CloudFront URL : $(terraform -chdir=terraform output -raw cloudfront_url)"
+if [ -n "$CUSTOM_URL" ]; then
+  echo "🔗 Custom domain  : $CUSTOM_URL"
+fi
+echo "📡 API Gateway    : $API_URL"
